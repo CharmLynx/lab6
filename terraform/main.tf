@@ -140,6 +140,3 @@ resource "aws_sns_topic_subscription" "sqs_subscription" {
   protocol  = "sqs"
   endpoint  = aws_sqs_queue.uploaded_files.arn
 }
-    events    = ["s3:ObjectCreated:*"]
-  }
-}
