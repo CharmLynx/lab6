@@ -1,113 +1,145 @@
-terraform {
-  required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~> 4.0"
-    }
+provider "aws" {
+
+  access_key = "mock_access_key"
+  secret_key = "mock_secret_key"
+  region = "eu-central-1"
+
+  s3_use_path_style  = true
+  skip_credentials_validation = true
+  skip_metadata_api_check = true
+  skip_requesting_account_id = true
+
+  endpoints {
+    s3 = "http://localhost:4566"
+    lambda = "http://localhost:4566"
+    sts = "http://localhost:4566"
+    iam = "http://localhost:4566"
+    sns = "http://localhost:4566"
+    sqs = "http://localhost:4566"
   }
 }
 
-resource "aws_s3_bucket" "s3_start" {
-  provider = aws.localstack
-  bucket   = "s3-start"
-}
-
-resource "aws_s3_bucket" "s3_finish" {
-  provider = aws.localstack
-  bucket   = "s3-finish"
-}
-
-resource "aws_s3_bucket_lifecycle_configuration" "s3_start_lifecycle" {
-  provider = aws.localstack
-  bucket   = aws_s3_bucket.s3_start.id
-
-  rule {
-    id     = "Move to Glacier"
+locals {
+  lifecycle_policy = {
+    id = "lifecycle-rule"
     status = "Enabled"
 
-    transition {
-      days          = 30
+    transition = {
+      days = 30
       storage_class = "GLACIER"
+    }
+
+    expiration = {
+      days = 365
     }
   }
 }
 
-resource "aws_iam_role" "lambda_exec_role" {
-  provider = aws.localstack
-  name     = "lambda_exec_role"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Action = "sts:AssumeRole"
-        Effect = "Allow"
-        Principal = {
-          Service = "lambda.amazonaws.com"
-        }
-      },
-    ]
-  })
+resource "aws_s3_bucket" "start_bucket" {
+  bucket = "s3-start"
 }
 
-resource "aws_iam_role_policy_attachment" "lambda_policy_attach" {
-  provider  = aws.localstack
-  role      = aws_iam_role.lambda_exec_role.name
-  policy_arn = "arn:aws:iam::aws:policy/AWSLambdaExecute"
+resource "aws_s3_bucket" "finish_bucket" {
+  bucket = "s3-finish"
 }
 
-resource "aws_lambda_function" "s3_copy_lambda" {
-  provider          = aws.localstack
-  filename          = "lambda_function.zip"
-  function_name     = "s3_copy_function"
-  role              = aws_iam_role.lambda_exec_role.arn
-  handler           = "lambda_function.lambda_handler"
-  runtime           = "python3.8"
-  source_code_hash  = filebase64sha256("lambda_function.zip")
-}
+resource "aws_s3_bucket_lifecycle_configuration" "start-lifecycle" {
+  bucket = aws_s3_bucket.start_bucket.id
 
-resource "aws_lambda_permission" "allow_s3_event" {
-  provider        = aws.localstack
-  statement_id    = "AllowExecutionFromS3Bucket"
-  action          = "lambda:InvokeFunction"
-  function_name   = aws_lambda_function.s3_copy_lambda.function_name
-  principal       = "s3.amazonaws.com"
-  source_arn      = aws_s3_bucket.s3_start.arn
-}
+  rule {
+    id = local.lifecycle_policy.id
+    status = local.lifecycle_policy.status
 
-resource "aws_s3_bucket_notification" "s3_start_notification" {
-  provider = aws.localstack
-  bucket   = aws_s3_bucket.s3_start.id
+    transition  {
+      days = local.lifecycle_policy.transition.days
+      storage_class = local.lifecycle_policy.transition.storage_class
+    }
 
-  lambda_function {
-    lambda_function_arn = aws_lambda_function.s3_copy_lambda.arn
-    events              = ["s3:ObjectCreated:*"]
+    expiration {
+      days = local.lifecycle_policy.expiration.days
+    }
   }
 }
 
-resource "aws_sns_topic" "example_topic" {
-  provider = aws.localstack
-  name     = "example-topic"
+resource "aws_s3_bucket_lifecycle_configuration" "finish-lifecycle" {
+  bucket = aws_s3_bucket.finish_bucket.id
+
+  rule {
+    id = local.lifecycle_policy.id
+    status = local.lifecycle_policy.status
+
+    transition  {
+      days = local.lifecycle_policy.transition.days
+      storage_class = local.lifecycle_policy.transition.storage_class
+    }
+
+    expiration {
+      days = local.lifecycle_policy.expiration.days
+    }
+  }
 }
 
-resource "aws_sns_topic_subscription" "example_subscription" {
-  provider  = aws.localstack
-  topic_arn = aws_sns_topic.example_topic.arn
-  protocol  = "lambda"
-  endpoint  = aws_lambda_function.s3_copy_lambda.arn
+data "aws_iam_policy_document" "lambda_policy" {
+  statement {
+    effect = "Allow"
+
+    principals {
+      type = "Service"
+      identifiers = ["lambda.amazonaws.com"]
+    }
+
+    actions = ["sts:AssumeRole"]
+  }
 }
 
-resource "aws_s3_bucket_notification" "s3_start_notification_with_sns" {
-  provider = aws.localstack
-  bucket   = aws_s3_bucket.s3_start.id
+resource "aws_iam_role" "lambda_role" {
+  name = "lambda_role"
+  assume_role_policy = data.aws_iam_policy_document.lambda_policy.json
+}
+
+data "archive_file" "lambda" {
+  type = "zip"
+  source_file = "lambda.py"
+  output_path = "lambda_function_payload.zip"
+}
+
+resource "aws_lambda_function" "lambda_function" {
+  filename = "lambda_function_payload.zip"
+  function_name = "lambda-function"
+  role = aws_iam_role.lambda_role.arn
+  handler = "lambda.lambda_handler"
+  runtime = "python3.10" 
+  source_code_hash = filebase64sha256(data.archive_file.lambda.output_path) 
+}
+
+resource "aws_s3_bucket_notification" "bucket_notification" {
+  bucket = "s3-start"
 
   lambda_function {
-    lambda_function_arn = aws_lambda_function.s3_copy_lambda.arn
-    events              = ["s3:ObjectCreated:*"]
+    lambda_function_arn = aws_lambda_function.lambda_function.arn
+    events = ["s3:ObjectCreated:*"]
   }
 
   topic {
-    topic_arn = aws_sns_topic.example_topic.arn
+    topic_arn = aws_sns_topic.uploads.arn
+
+    events = ["s3:ObjectCreated:*"]    
+  }
+}
+
+resource "aws_sns_topic" "uploads" {
+  name = "uploads"
+}
+
+resource "aws_sqs_queue" "uploaded_files" {
+  name = "uploaded-files"
+}
+
+resource "aws_sns_topic_subscription" "sqs_subscription" {
+  topic_arn = aws_sns_topic.uploads.arn
+  protocol  = "sqs"
+  endpoint  = aws_sqs_queue.uploaded_files.arn
+}
     events    = ["s3:ObjectCreated:*"]
   }
 }
